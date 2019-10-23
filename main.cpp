@@ -324,8 +324,12 @@ int main(int argc, char* argv[])
 	type_ip = htons((uint16_t)ETHERTYPE_IPV4);
 	operation_chk = htons((uint16_t)1);
 
-	pthread_create(&tid, NULL, periodic_arp_attack, (void*)handle);
-
+	if(pthread_create(&tid, NULL, periodic_arp_attack, (void*)handle)) 
+	{
+		printf("thread create error!\n");
+		return -1;
+	}
+	printf("Start!!\n");
 	while (true)
 	{
 		struct pcap_pkthdr* header;
@@ -340,18 +344,23 @@ int main(int argc, char* argv[])
 		if((req_ether->ether_type)==type_ip) 
 		{
 			struct sniff_ip * req_ip = (struct sniff_ip *)(packet + ETHERNET_SIZE);
-			for(; it != sessions.end(); it++)
+			for(it=sessions.begin(); it != sessions.end(); it++)
 			{
 				struct in_addr sender_ip, target_ip;
 				sender_ip.s_addr = (*it).first.s_addr;
 				target_ip.s_addr = (*it).second.s_addr;
 				uint32_t relay_length = ntohs(req_ip->ip_len) + ETHERNET_SIZE;	
-				if((req_ip->ip_src.s_addr == sender_ip.s_addr) && (req_ip->ip_dst.s_addr == target_ip.s_addr)) try_relay(handle,  (struct ethernet *)packet, relay_length, target_ip.s_addr);
+				if((target_ip.s_addr>>24) == 1){
+					if((req_ip->ip_src.s_addr == sender_ip.s_addr) && (req_ip->ip_dst.s_addr != my_ip.s_addr)) try_relay(handle,  (struct ethernet *)packet, relay_length, target_ip.s_addr);
+			}
+				else{
+					if((req_ip->ip_src.s_addr == sender_ip.s_addr) && (req_ip->ip_dst.s_addr == target_ip.s_addr)) try_relay(handle,  (struct ethernet *)packet, relay_length, target_ip.s_addr);
+				}
 			}
 		}
 		else if((req_ether->ether_type)==type_arp)
 		{
-			for(; it != sessions.end(); it++){
+			for(it=sessions.begin(); it != sessions.end(); it++){
 				struct in_addr sender_ip, target_ip;
                                 sender_ip.s_addr = (*it).first.s_addr;
                                 target_ip.s_addr = (*it).second.s_addr;
